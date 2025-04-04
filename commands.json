@@ -1,0 +1,14 @@
+[
+  {
+    "name": "ping",
+    "description": "Antwortet mit Pong!"
+  },
+  {
+    "name": "info",
+    "description": "Zeigt Infos zum Bot."
+  },
+  {
+    "name": "manual_aufstellung",
+    "description": "Postet sofort eine Aufstellung für den nächsten Tag."
+  }
+]
