@@ -30,9 +30,7 @@ const client = new Client({
 
 // === Slash Commands ===
 const commands = [
-  new SlashCommandBuilder().setName('ping').setDescription('Antwortet mit Pong!'),
-  new SlashCommandBuilder().setName('info').setDescription('Infos zum Bot'),
-  new SlashCommandBuilder().setName('manual_aufstellung').setDescription('Postet sofort eine Aufstellung')
+  new SlashCommandBuilder().setName('aufstellung').setDescription('Postet sofort eine Aufstellung')
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
