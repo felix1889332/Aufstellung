@@ -1,183 +1,191 @@
 require('dotenv').config();
+const fs = require('fs');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
 const cron = require('node-cron');
 const express = require('express');
 const moment = require('moment-timezone');
 const { request } = require('undici');
 
+// === Webserver für UptimeRobot & Self-Ping ===
 const app = express();
 const port = 3000;
-const lastAufstellungMessages = {}; // channelId => messageId
-
-// === Express Webserver für UptimeRobot & Self-Ping ===
-app.get('/', (req, res) => res.send('🟢 Bot is alive!'));
+app.get('/', (_, res) => res.send('🟢 Bot is alive!'));
 app.listen(port, () => console.log(`🌐 Keep-Alive Server läuft auf Port ${port}`));
-
-// === Self-Ping ===
 setInterval(() => {
   request('http://localhost:3000').catch(err => console.error('❌ Self-Ping fehlgeschlagen:', err));
 }, 5 * 60 * 1000);
 
-// === Discord Client Initialisierung ===
+// === Nachrichtenverlauf laden
+let lastMessages = {};
+try {
+  lastMessages = JSON.parse(fs.readFileSync('lastMessages.json', 'utf8'));
+} catch { console.log("ℹ️ lastMessages.json wird neu erstellt"); }
+
+// === Discord Client
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.MessageContent
   ]
 });
 
-// === Slash Commands ===
+// === Slash Commands
 const commands = [
-  new SlashCommandBuilder().setName('aufstellung').setDescription('Postet sofort eine Aufstellung')
+  new SlashCommandBuilder().setName('aufstellung').setDescription('Postet sofort eine Aufstellung'),
+  new SlashCommandBuilder().setName('manual_aufstellung').setDescription('Postet manuell'),
+  new SlashCommandBuilder().setName('ping').setDescription('Antwortet mit Pong!'),
+  new SlashCommandBuilder().setName('info').setDescription('Infos zum Bot')
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
 
+// === Bot Ready
 client.once('ready', async () => {
   console.log(`✅ Eingeloggt als ${client.user.tag}`);
+  client.user.setPresence({ activities: [{ name: "RP-Aktivität", type: 3 }], status: 'online' });
+
   try {
-    await rest.put(
-      Routes.applicationCommands(client.user.id),
-      { body: commands }
-    );
-    console.log('✅ Slash Commands registriert');
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log("✅ Slash Commands registriert");
   } catch (err) {
-    console.error('❌ Slash Commands Registrierung fehlgeschlagen:', err);
+    console.error("❌ Fehler beim Registrieren:", err);
+    notifyError(`SlashCommand Fehler: ${err.message}`);
   }
+
+  const startupChannel = await fetchChannel(process.env.STARTUP_CHANNEL_ID);
+  if (startupChannel) startupChannel.send("🟢 **Bot wurde gestartet**");
 });
 
-// === Aufstellung posten ===
-async function postAufstellungInAllChannels() {
+// === Aufstellung posten
+async function postAufstellung() {
   const morgen = moment().tz("Europe/Berlin").add(1, 'days').format('DD.MM.');
-  const messageText = `**Aufstellung am ${morgen} um 20 Uhr**
+  const text = `**Aufstellung am ${morgen} um 20 Uhr**\n\nReagiere bis **19 Uhr**. Wer nicht reagiert = Sanki <@BBG>`;
 
-Ihr habt Zeit bis **19 Uhr** zu reagieren.
+  const ids = process.env.CHANNEL_IDS.split(',');
+  for (const id of ids) {
+    const channel = await fetchChannel(id.trim());
+    if (!channel) continue;
 
-Erscheint rechtzeitig am Cage, ausgerüstet mit dem erforderlichen Mindestbestand.
-
-**Reagieren oder Sanki kassieren** <@BBG>`;
-
-  const channelIds = process.env.CHANNEL_IDS.split(',');
-
-  for (const id of channelIds) {
     try {
-      const channel = await client.channels.fetch(id.trim());
-      const msg = await channel.send(messageText);
+      const msg = await channel.send(text);
       await msg.react('✅');
       await msg.react('❌');
-      lastAufstellungMessages[id.trim()] = msg.id;
-      console.log(`📢 Aufstellung in Channel ${id} gesendet`);
-    } catch (error) {
-      console.error(`❌ Fehler beim Posten in Channel ${id}:`, error);
+
+      lastMessages[id.trim()] = msg.id;
+      fs.writeFileSync('lastMessages.json', JSON.stringify(lastMessages, null, 2));
+      console.log(`📢 Aufstellung in ${id} gesendet`);
+    } catch (e) {
+      console.error(`❌ Fehler in ${id}:`, e);
+      notifyError(`Fehler beim Senden in ${id}: ${e.message}`);
     }
   }
 }
 
-// === Täglicher Cronjob: Aufstellung um 20:00 Uhr ===
-cron.schedule('0 20 * * *', () => {
-  console.log('🕗 Starte täglichen Aufstellungspost');
-  postAufstellungInAllChannels();
-}, {
-  timezone: "Europe/Berlin"
-});
+// === Auswertung
+async function auswerten() {
+  const logChannel = await fetchChannel(process.env.LOG_CHANNEL_ID);
+  if (!logChannel) return;
 
-// === Täglicher Cronjob: Auswertung um 19:00 Uhr ===
-cron.schedule('0 19 * * *', async () => {
-  console.log('📊 Starte Auswertung der Reaktionen');
+  const ids = process.env.CHANNEL_IDS.split(',');
+  for (const id of ids) {
+    const channel = await fetchChannel(id.trim());
+    if (!channel) continue;
 
-  try {
-    const logChannel = await client.channels.fetch(process.env.LOG_CHANNEL_ID);
-    if (!logChannel) {
-      console.error('❌ Log-Channel nicht gefunden!');
-      return;
+    const msgId = lastMessages[id.trim()];
+    if (!msgId) continue;
+
+    try {
+      const message = await channel.messages.fetch(msgId);
+      const yes = message.reactions.cache.get('✅');
+      const no = message.reactions.cache.get('❌');
+
+      const zusagen = yes ? [...(await yes.users.fetch()).values()].filter(u => !u.bot).map(u => u.username) : [];
+      const absagen = no ? [...(await no.users.fetch()).values()].filter(u => !u.bot).map(u => u.username) : [];
+
+      const heute = moment().tz("Europe/Berlin").format('DD.MM.');
+      const summary = `📋 **Aufstellung ${heute}** (<#${id}>):\n✅ ${zusagen.join(', ') || 'Keine'}\n❌ ${absagen.join(', ') || 'Keine'}`;
+
+      await logChannel.send(summary);
+    } catch (e) {
+      console.error(`❌ Fehler bei Auswertung in ${id}:`, e);
+      notifyError(`Fehler bei Auswertung in ${id}: ${e.message}`);
     }
-
-    const channelIds = process.env.CHANNEL_IDS.split(',');
-
-    for (const id of channelIds) {
-      try {
-        const channel = await client.channels.fetch(id.trim());
-        const messageId = lastAufstellungMessages[id.trim()];
-        if (!messageId) {
-          console.warn(`⚠️ Keine gespeicherte Nachricht für Channel ${id}`);
-          continue;
-        }
-
-        const message = await channel.messages.fetch(messageId);
-        const reactions = message.reactions.cache;
-
-        const zusagen = [];
-        const absagen = [];
-
-        const yes = reactions.get('✅');
-        const no = reactions.get('❌');
-
-        if (yes) {
-          const users = await yes.users.fetch();
-          users.forEach(u => { if (!u.bot) zusagen.push(u.username); });
-        }
-
-        if (no) {
-          const users = await no.users.fetch();
-          users.forEach(u => { if (!u.bot) absagen.push(u.username); });
-        }
-
-        const heute = moment().tz("Europe/Berlin").format('DD.MM.');
-        const summary = `📋 **Reaktionen zur Aufstellung am ${heute}** (Channel: <#${id.trim()}>)\n\n` +
-          `✅ **Zugesagt:** ${zusagen.length > 0 ? zusagen.join(', ') : 'Keine'}\n` +
-          `❌ **Abgesagt:** ${absagen.length > 0 ? absagen.join(', ') : 'Keine'}`;
-
-        await logChannel.send(summary);
-        console.log(`📩 Auswertung in Log-Channel gepostet (${id})`);
-      } catch (err) {
-        console.error(`❌ Fehler beim Auslesen in Channel ${id}:`, err);
-      }
-    }
-  } catch (err) {
-    console.error('❌ Fehler bei Auswertungsroutine:', err);
   }
-}, {
-  timezone: "Europe/Berlin"
-});
+}
 
-// === Slash Command Handling ===
+// === Cronjobs
+cron.schedule('0 20 * * *', () => {
+  console.log("🕗 Cron 20:00 – Aufstellung");
+  postAufstellung();
+}, { timezone: "Europe/Berlin" });
+
+cron.schedule('0 19 * * *', () => {
+  console.log("🕖 Cron 19:00 – Auswertung");
+  auswerten();
+}, { timezone: "Europe/Berlin" });
+
+// === SlashCommand Handling
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
-
   try {
-    if (interaction.commandName === 'ping') {
-      await interaction.reply('🏓 Pong!');
+    const { commandName } = interaction;
+
+    if (commandName === 'aufstellung' || commandName === 'manual_aufstellung') {
+      await postAufstellung();
+      return interaction.reply({ content: "📨 Aufstellung gesendet", ephemeral: true });
     }
 
-    if (interaction.commandName === 'info') {
-      await interaction.reply({
-        content: 'Ich bin der tägliche Aufstellungs-Bot. Poste jeden Tag um 20 Uhr und werte um 19 Uhr aus.',
-        ephemeral: true
-      });
+    if (commandName === 'ping') {
+      return interaction.reply("🏓 Pong!");
     }
 
-    if (interaction.commandName === 'manual_aufstellung') {
-      await postAufstellungInAllChannels();
-      await interaction.reply({ content: '📢 Aufstellung wurde manuell gepostet.', ephemeral: true });
+    if (commandName === 'info') {
+      return interaction.reply("🤖 Ich poste täglich um 20 Uhr die Aufstellung und werte um 19 Uhr aus.");
     }
-  } catch (err) {
-    console.error('❌ Fehler bei Command:', err);
-    if (interaction.reply) {
-      await interaction.reply({ content: '❌ Es gab einen Fehler beim Ausführen des Befehls.', ephemeral: true });
-    }
+  } catch (e) {
+    console.error("❌ Fehler im SlashCommand:", e);
+    notifyError(`SlashCommand Fehler: ${e.message}`);
+    if (interaction.replied || interaction.deferred) return;
+    await interaction.reply({ content: "❌ Fehler beim Ausführen.", ephemeral: true });
   }
 });
 
-// === Globale Fehlerbehandlung ===
-process.on('unhandledRejection', (error) => {
-  console.error('❌ Unhandled Promise Rejection:', error);
+// === Fehler-Handling & Benachrichtigung
+process.on("unhandledRejection", (err) => {
+  console.error("❌ Unhandled Promise:", err);
+  notifyError(`Unhandled Rejection:\n${err.message}`);
+});
+process.on("uncaughtException", (err) => {
+  console.error("💥 Uncaught Exception:", err);
+  notifyError(`Uncaught Exception:\n${err.message}`);
 });
 
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
-});
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+// === Helper
+async function fetchChannel(id) {
+  try {
+    const ch = await client.channels.fetch(id);
+    return ch && ch.viewable ? ch : null;
+  } catch {
+    console.error(`❌ Channel ${id} nicht erreichbar`);
+    return null;
+  }
+}
+
+async function notifyError(msg) {
+  const ch = await fetchChannel(process.env.ALERT_CHANNEL_ID);
+  if (ch) ch.send(`🚨 Fehler:\n\`\`\`${msg}\`\`\``).catch(console.error);
+}
+
+async function shutdown() {
+  const ch = await fetchChannel(process.env.STARTUP_CHANNEL_ID);
+  if (ch) await ch.send("🔴 Bot wird beendet...");
+  process.exit(0);
+}
 
 client.login(process.env.TOKEN);
+
 
