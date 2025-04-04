@@ -59,7 +59,7 @@ Ihr habt Zeit bis **19 Uhr** zu reagieren.
 
 Erscheint rechtzeitig am Cage, ausgerüstet mit dem erforderlichen Mindestbestand.
 
-**Reagieren oder Sanki kassieren** <@&BBG>`;
+**Reagieren oder Sanki kassieren** <@BBG>`;
 
   const channelIds = process.env.CHANNEL_IDS.split(',');
 
